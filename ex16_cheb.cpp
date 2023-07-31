@@ -7,7 +7,6 @@
 #include <igl/lbs_matrix.h>
 #include <igl/deform_skeleton.h>
 #include <igl/normalize_row_sums.h>
-#include <igl/readDMAT.h>
 #include <igl/readMESH.h>
 #include <igl/readTGF.h>
 #include <igl/opengl/glfw/Viewer.h>
@@ -20,13 +19,13 @@
 #include <iostream>
 
 typedef std::vector<Eigen::Quaterniond,
-                    Eigen::aligned_allocator<Eigen::Quaterniond> >
+                    Eigen::aligned_allocator<Eigen::Quaterniond>>
     RotationList;
 
 const Eigen::RowVector3d sea_green(70. / 255., 252. / 255., 167. / 255.);
 int selected = 0;
 Eigen::MatrixXd V, W, U, C, M;
-Eigen::MatrixXi T, F, BE;
+Eigen::MatrixXi T, F, CE, BE;
 Eigen::VectorXi P;
 RotationList pose;
 double anim_t = 1.0;
@@ -36,37 +35,6 @@ bool pre_draw(igl::opengl::glfw::Viewer &viewer) {
   using namespace Eigen;
   using namespace std;
   if (viewer.core().is_animating) {
-    // Interpolate pose and identity
-    RotationList anim_pose(pose.size());
-    for (int e = 0; e < pose.size(); e++) {
-      anim_pose[e] = pose[e].slerp(anim_t, Quaterniond::Identity());
-    }
-    // Propagate relative rotations via FK to retrieve absolute transformations
-    RotationList vQ;
-    vector<Vector3d> vT;
-    igl::forward_kinematics(C, BE, P, anim_pose, vQ, vT);
-    const int dim = C.cols();
-    MatrixXd T(BE.rows() * (dim + 1), dim);
-    for (int e = 0; e < BE.rows(); e++) {
-      Affine3d a = Affine3d::Identity();
-      a.translate(vT[e]);
-      a.rotate(vQ[e]);
-      T.block(e * (dim + 1), 0, dim + 1, dim) =
-          a.matrix().transpose().block(0, 0, dim + 1, dim);
-    }
-    // Compute deformation via LBS as matrix multiplication
-    U = M * T;
-
-    // Also deform skeleton edges
-    MatrixXd CT;
-    MatrixXi BET;
-    igl::deform_skeleton(C, BE, T, CT, BET);
-
-    viewer.data().set_vertices(U);
-    viewer.data().set_edges(CT, BET, sea_green);
-    viewer.data().compute_normals();
-    anim_t += anim_t_dir;
-    anim_t_dir *= (anim_t >= 1.0 || anim_t <= 0.0 ? -1.0 : 1.0);
   }
   return false;
 }
@@ -78,13 +46,11 @@ bool key_down(igl::opengl::glfw::Viewer &viewer, unsigned char key, int mods) {
       break;
     case '.':
       selected++;
-      std::cout << "change selected point to " << selected << "\n";
       selected = std::min(std::max(selected, 0), (int)W.cols() - 1);
       viewer.data().set_data(W.col(selected));
       break;
     case ',':
       selected--;
-      std::cout << "change selected point to " << selected << "\n";
       selected = std::min(std::max(selected, 0), (int)W.cols() - 1);
       viewer.data().set_data(W.col(selected));
       break;
@@ -92,38 +58,114 @@ bool key_down(igl::opengl::glfw::Viewer &viewer, unsigned char key, int mods) {
   return true;
 }
 
+bool readTGF(const std::string &filename, Eigen::MatrixXd &C,
+             Eigen::VectorXi &P, Eigen::MatrixXi &BE, Eigen::MatrixXi &CE) {
+  using namespace std;
+  vector<vector<double>> vC;
+  vector<vector<int>> vCE;
+  vector<vector<int>> vBE;
+  vector<int> vP;
+  vC.clear();
+  vCE.clear();
+  vBE.clear();
+  vP.clear();
+
+  FILE *tgf_file = fopen(filename.c_str(), "r");
+  if (tgf_file == NULL) {
+    fprintf(stderr, "Error: could not open file %s\n", filename.c_str());
+    return false;
+  }
+
+  bool reading_vertices = true;
+  bool reading_edges = true;
+  const int MAX_LINE_LENGTH = 500;
+  char line[MAX_LINE_LENGTH];
+
+  while (fgets(line, MAX_LINE_LENGTH, tgf_file) != NULL) {
+    if (line[0] == '#') {
+      if (reading_vertices) {
+        reading_vertices = false;
+        reading_edges = true;
+      } else if (reading_edges) {
+        reading_edges = false;
+      }
+    } else if (reading_vertices) {
+      int index;
+      vector<double> position(3);
+      int count = sscanf(line, "%d %lg %lg %lg", &index, &position[0],
+                         &position[1], &position[2]);
+      if (count != 4) {
+        fprintf(stderr, "Error: readTGF.h: bad format in vertex line\n");
+        fclose(tgf_file);
+        return false;
+      }
+      // index is ignored since vertices must already be in order
+      vC.push_back(position);
+    } else if (reading_edges) {
+      vector<int> edge(2);
+      int type;
+      int count = sscanf(line, "%d %d %d", &edge[0], &edge[1], &type);
+      if (count != 3) {
+        fprintf(stderr, "Error: readTGF.h: bad format in edge line\n");
+        fclose(tgf_file);
+        return false;
+      }
+      if (type == 1)
+        vBE.push_back(edge);
+      else if (type == 2) {
+        vCE.push_back(edge);
+        vP.push_back(edge[0]);
+        vP.push_back(edge[1]);
+      } else if (type == 0)
+        vP.push_back(edge[0]);
+    }
+  }
+  fclose(tgf_file);
+  igl::list_to_matrix(vC, C);
+  igl::list_to_matrix(vCE, CE);
+  igl::list_to_matrix(vBE, BE);
+  igl::list_to_matrix(vP, P);
+  return true;
+}
+
+void save_matrix(const std::string &filename, const Eigen::MatrixXd &M) {
+  std::ofstream out(filename);
+  out << M;
+  out.close();
+}
+
 int main(int argc, char *argv[]) {
   using namespace Eigen;
   using namespace std;
-  igl::readMESH(TUTORIAL_SHARED_PATH "/hand.mesh", V, T, F);
-  U = V;
-  igl::readTGF(TUTORIAL_SHARED_PATH "/hand.tgf", C, BE);
-  // retrieve parents for forward kinematics
-  igl::directed_edge_parents(BE, P);
 
-  // Read pose as matrix of quaternions per row
-  MatrixXd Q;
-  igl::readDMAT(TUTORIAL_SHARED_PATH "/hand-pose.dmat", Q);
-  igl::column_to_quats(Q, pose);
-  assert(pose.size() == BE.rows());
+  assert(argc == 3);
+
+  std::string filename = argv[1];
+  std::string tgfname = argv[2];
+
+  igl::readMESH(TUTORIAL_SHARED_PATH "/" + filename + ".mesh", V, T, F);
+  U = V;
+
+  readTGF(TUTORIAL_SHARED_PATH "/" + tgfname + ".tgf", C, P, BE, CE);
 
   // List of boundary indices (aka fixed value indices into VV)
   VectorXi b;
   // List of boundary conditions of each weight function
   MatrixXd bc;
+  // VectorXi P(C.rows());
+  // P.setLinSpaced(P.size(), 0, P.size() - 1);
   std::cout << V.rows() << " " << V.cols() << "\n";
   std::cout << T.rows() << " " << T.cols() << "\n";
   std::cout << C << std::endl;
   std::cout << BE << std::endl;
-  igl::boundary_conditions(V, T, C, VectorXi(), BE, MatrixXi(), b, bc);
+  std::cout << P << std::endl;
+  igl::boundary_conditions(V, T, C, P, BE, MatrixXi(), b, bc);
 
   // compute BBW weights matrix
   igl::BBWData bbw_data;
   // only a few iterations for sake of demo
-  bbw_data.active_set_params.max_iter = 8;
+  bbw_data.active_set_params.max_iter = 24;
   bbw_data.verbosity = 2;
-  std::cout << "b: " << b << std::endl;
-  std::cout << "bc: " << bc << std::endl;
   if (!igl::bbw(V, T, b, bc, bbw_data, W)) {
     return EXIT_FAILURE;
   }
@@ -142,10 +184,14 @@ int main(int argc, char *argv[]) {
   // precompute linear blend skinning matrix
   igl::lbs_matrix(V, W, M);
 
+  std::cout << "M shape: " << M.rows() << " " << M.cols() << std::endl;
+  std::cout << "W shape: " << W.rows() << " " << W.cols() << std::endl;
+  save_matrix(TUTORIAL_SHARED_PATH "/" + filename + "_w.txt", W);
+
   // Plot the mesh with pseudocolors
   igl::opengl::glfw::Viewer viewer;
   viewer.data().set_mesh(U, F);
-  viewer.data().set_data(W.col(selected));
+  // viewer.data().set_data(W.col(selected));
   viewer.data().set_edges(C, BE, sea_green);
   viewer.data().show_lines = false;
   viewer.data().show_overlay_depth = false;
